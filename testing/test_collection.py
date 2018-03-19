@@ -399,11 +399,11 @@ class TestSession(object):
         config = testdir.parseconfig(p.basename)
         rcol = Session(config=config)
         assert rcol.fspath == subdir
-        parts = rcol._parsearg(p.basename)
+        parts, _, _ = rcol._parsearg(p.basename)
 
         assert parts[0] == target
         assert len(parts) == 1
-        parts = rcol._parsearg(p.basename + "::test_func")
+        parts, _, _ = rcol._parsearg(p.basename + "::test_func")
         assert parts[0] == target
         assert parts[1] == "test_func"
         assert len(parts) == 2
@@ -717,6 +717,68 @@ class TestCollectLineOption(object):
         assert "test_1.py::test_01" not in result.stdout.str()
         assert "test_1.py::test_03" not in result.stdout.str()
 
+    def test_collect_several_lines(self, testdir):
+        p = testdir.makepyfile(test_1="""
+        def test_01():
+            assert 1
+
+        def test_02():
+            assert 1
+
+        def test_03():
+            assert 1
+        """)
+        result = testdir.runpytest("{}:{}".format(p, 1), "{}:{}".format(p, 40), "-v")
+        result.stdout.fnmatch_lines("*test_1.py::test_01 PASSED*")
+        result.stdout.fnmatch_lines("*test_1.py::test_03 PASSED*")
+        assert "test_1.py::test_02" not in result.stdout.str()
+
+    def test_collect_file_and_line(self, testdir):
+        p = testdir.makepyfile(test_1="""
+        def test_01():
+            assert 1
+
+        def test_02():
+            assert 1
+
+        def test_03():
+            assert 1
+        """)
+        result = testdir.runpytest("{}:{}".format(p, 1), "{}".format(p), "-v")
+        result.stdout.fnmatch_lines("*test_1.py::test_01 PASSED*")
+        result.stdout.fnmatch_lines("*test_1.py::test_01 PASSED*")
+        result.stdout.fnmatch_lines("*test_1.py::test_02 PASSED*")
+        result.stdout.fnmatch_lines("*test_1.py::test_03 PASSED*")
+
+    def test_collect_several_lines_and_files(self, testdir):
+        p1 = testdir.makepyfile(test_1="""
+        def test_01():
+            assert 1
+
+        def test_02():
+            assert 1
+
+        def test_03():
+            assert 1
+        """)
+        p2 = testdir.makepyfile(test_2="""
+        def test_01():
+            assert 1
+
+        def test_02():
+            assert 1
+
+        def test_03():
+            assert 1
+        """)
+        result = testdir.runpytest("{}:{}".format(p1, 1), "{}:{}".format(p1, 40), "{}".format(p2), "-v")
+        result.stdout.fnmatch_lines("*test_1.py::test_01 PASSED*")
+        result.stdout.fnmatch_lines("*test_1.py::test_03 PASSED*")
+        result.stdout.fnmatch_lines("*test_2.py::test_01 PASSED*")
+        result.stdout.fnmatch_lines("*test_2.py::test_02 PASSED*")
+        result.stdout.fnmatch_lines("*test_2.py::test_03 PASSED*")
+        assert "test_1.py::test_02" not in result.stdout.str()
+
     @pytest.mark.parametrize("line", [5, 6, 7, 8])
     def test_collect_line_with_parametrize(self, testdir, line):
         p = testdir.makepyfile(test_1="""
@@ -791,8 +853,8 @@ class TestCollectLineOption(object):
         """)
         result = testdir.runpytest("{}:{}".format(p, 0), "-v")
         result.stdout.fnmatch_lines("*test_1.py::TestLine::test_01*")
-        assert "test_1.py::test_02" not in result.stdout.str()
-        assert "test_1.py::test_03" not in result.stdout.str()
+        result.stdout.fnmatch_lines("*test_1.py::TestLine::test_02*")
+        result.stdout.fnmatch_lines("*test_1.py::TestLine::test_03*")
 
     def test_collect_line_boundary_values_max(self, testdir):
         p = testdir.makepyfile(test_1="""

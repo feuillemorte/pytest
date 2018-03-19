@@ -1,6 +1,7 @@
 """ core implementation of testing process: init, session, runtest loop. """
 from __future__ import absolute_import, division, print_function
 
+import collections
 import contextlib
 import functools
 import os
@@ -9,6 +10,8 @@ import re
 
 import six
 import sys
+
+from bisect import bisect_right
 
 import _pytest
 from _pytest import nodes
@@ -298,6 +301,7 @@ class Failed(Exception):
 class Session(nodes.FSCollector):
     Interrupted = Interrupted
     Failed = Failed
+    _PATH_WITH_LINENUM_PATTERN = re.compile(r':(?P<line>\d+)$')
 
     def __init__(self, config):
         nodes.FSCollector.__init__(
@@ -310,7 +314,6 @@ class Session(nodes.FSCollector):
         self.trace = config.trace.root.get("collection")
         self._norecursepatterns = config.getini("norecursedirs")
         self.startdir = py.path.local()
-        self.file_line = None
         self.config.pluginmanager.register(self, name="session")
 
     def _makeid(self):
@@ -370,11 +373,13 @@ class Session(nodes.FSCollector):
         self._notfound = []
         self._initialpaths = set()
         self._initialparts = []
-        self.items = items = []
+        self.items = []
+        _path_and_line = collections.defaultdict(list)
         for arg in args:
-            parts = self._parsearg(arg)
+            parts, path, line = self._parsearg(arg)
             self._initialparts.append(parts)
             self._initialpaths.add(parts[0])
+            _path_and_line[path].append(line)
         rep = collect_one_node(self)
         self.ihook.pytest_collectreport(report=rep)
         self.trace.root.indent -= 1
@@ -390,12 +395,18 @@ class Session(nodes.FSCollector):
         else:
             if rep.passed:
                 for node in rep.result:
-                    items_list = []
-                    items_list.extend(self.genitems(node))
-                    if self.file_line:
-                        items_list = self._find_nearest_test_function(items_list)
-                    self.items.extend(items_list)
-            return items
+                    items = [x for x in self.genitems(node)]
+                    if not items:
+                        continue
+                    name = items[0].location[0]
+                    result = None
+                    for key in _path_and_line.keys():
+                        if name in key:
+                            result = self._find_nearest_test_function(_path_and_line[key].pop(0), items)
+                            break
+
+                    self.items.extend(items) if not result else self.items.extend(result)
+            return self.items
 
     def collect(self):
         for parts in self._initialparts:
@@ -413,7 +424,7 @@ class Session(nodes.FSCollector):
             self.trace.root.indent -= 1
 
     def _collect(self, arg):
-        names = self._parsearg(arg)
+        names, _, _ = self._parsearg(arg)
         path = names.pop(0)
         if path.check(dir=1):
             assert not names, "invalid arg %r" % (arg,)
@@ -469,16 +480,17 @@ class Session(nodes.FSCollector):
         return path
 
     def _parsearg(self, arg):
-        """ return (fspath, names) tuple after checking the file exists. """
+        """ return (fspath, names) tuple, path and line after checking the file exists. """
+        line = None
         parts = str(arg).split("::")
         if self.config.option.pyargs:
             parts[0] = self._tryconvertpyarg(parts[0])
         relpath = parts[0].replace("/", os.sep)
         path = self.config.invocation_dir.join(relpath, abs=True)
         if not path.check():
-            try:
-                path = self._filter_by_line(relpath)
-            except UsageError:
+            relpath, line = self._split_line_num(relpath)
+            path = self.config.invocation_dir.join(relpath, abs=True)
+            if not path.check():
                 if self.config.option.pyargs:
                     raise UsageError(
                         "file or package not found: " + arg +
@@ -486,95 +498,49 @@ class Session(nodes.FSCollector):
                 else:
                     raise UsageError("file not found: " + arg)
         parts[0] = path
-        return parts
+        return parts, str(path), line
 
-    def _filter_by_line(self, path):
-        PATTERN_LINE = re.compile(r':(?P<line>[0-9]+)$')
-
+    def _split_line_num(self, path):
+        line = None
         path = str(path)
-        match = re.search(PATTERN_LINE, path)
+        match = re.search(self._PATH_WITH_LINENUM_PATTERN, path)
 
         if match:
-            self.file_line = path[match.start() + 1:match.end()]
+            line = int(path[match.start() + 1:match.end()])
             path = path[:match.start()]
-        path = self.config.invocation_dir.join(path, abs=True)
-        if not path.check():
-            raise UsageError()
+        return path, line
 
-        return path
-
-    def _find_nearest_test_function(self, items):
+    def _find_nearest_test_function(self, line, items):
         """
         Finds the nearest test function given a path in the form:
 
         path/to/test.py:12
 
-        With ``12`` being a line number, search upwards or downwards in the file
-        until it finds a test function declaration.
+        With ``12`` being a line number, search upwards in the file
+        until it finds a test function declaration. If no tests found pytest
+        run all tests
 
         :return: a filtered item list
         """
 
         items = sorted(items, key=lambda x: x.location)
-        mid = self._find_nearest_point_to_line(items)
-        return self._find_all_items_nearest_to_point(items, mid)
+        items_loc = [item.location[1] for item in items]
 
-    def _find_nearest_point_to_line(self, items):
-        """
-        Find nearest index of items list to file line
-        :param items:
-        :return: index of item list nearest to file line
-        """
-        line = int(self.file_line) - 1
-        mid = 0
-        lo = 0
-        hi = len(items)
-        while lo < hi:
-            mid = (lo+hi)//2
-            midval = items[mid].location[1]
-            next_to_midval = items[mid+1].location[1] if len(items) > mid + 1 else items[mid].location[1]
-            if line not in list(range(midval, next_to_midval)):
-                if midval < line:
-                    lo = mid+1
-                elif midval > line:
-                    hi = mid
-                else:
-                    return mid
-            else:
-                return mid
-        return mid
+        new_item_list = []
+        if not line:
+            return items
+        i = bisect_right(items_loc, line - 1)
+        if i != 0:
+            i -= 1
+        else:
+            return items
 
-    def _find_all_items_nearest_to_point(self, items, point):
-        """
-        Find all items where location is equal as location of item[point]
-        :param items: items list
-        :param point: index of items list
-        :return: filtered items list
-        """
-        if not items:
-            return []
-        items_list = [items[point]]
-        loc = items[point].location[1]
-        start_point = point
-        up = True
-        down = True
+        new_item_list.append(items[i])
+        while items[i-1].location[1] == items[i].location[1]:
+            new_item_list.append(items[i-1])
+            i -= 1
 
-        while up or down:
-            if down:
-                point += 1
-                if point < len(items) and items[point].location[1] == loc:
-                    items_list.append(items[point])
-                else:
-                    point = start_point
-                    down = False
-            elif up:
-                point -= 1
-                if point > 0 and items[point].location[1] == loc:
-                    items_list.append(items[point])
-                else:
-                    point = start_point
-                    up = False
-        return items_list
+        return sorted(new_item_list, key=lambda x: x.location)
 
     def matchnodes(self, matching, names):
         self.trace("matchnodes", matching, names)
